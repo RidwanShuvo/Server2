@@ -5,7 +5,7 @@ const path = require('path');
 // Configure multer for file uploads
 const storage = multer.memoryStorage();
 
-// File filter to only allow specific file types
+// File filter to only allow specific file types 
 const fileFilter = (req, file, cb) => {
   // Allowed file types
   const allowedTypes = [
