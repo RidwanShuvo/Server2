@@ -1,10 +1,11 @@
 const express = require("express");
 const cors = require("cors");
 require("dotenv").config();
-const multer = require("multer"); // require multer at the top
-const upload = multer({ storage: multer.memoryStorage() }); // define multer upload
+const { upload, handleUploadError } = require('./middleware/upload');
+const { testConnection, uploadToCloudinary } = require('./config/cloudinary');
+const databaseManager = require('./config/database');
+const { ObjectId } = require("mongodb");
 const app = express();
-const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const port = process.env.PORT || 5000;
 
 // Middleware
@@ -16,87 +17,139 @@ app.use(
 );
 app.use(express.json());
 
-// MongoDB connection
-const uri = `mongodb+srv://ridwanshuvo38:ridwanshuvo38@clusterresearch.nrhvslo.mongodb.net/research_portal?retryWrites=true&w=majority`;
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
+// Database connection check middleware
+const checkDatabaseConnection = async (req, res, next) => {
+  if (!databaseManager.isDatabaseConnected()) {
+    return res.status(503).json({
+      success: false,
+      message: "Database connection lost. Please try again.",
+      error: "DATABASE_DISCONNECTED"
+    });
+  }
+  next();
+};
 
-let ResearchCollection;
-
-async function run() {
+// Initialize server
+async function initializeServer() {
   try {
-    await client.connect();
-    ResearchCollection = client.db("research_portal").collection("researchpapers");
+    // Connect to MongoDB
+    const dbConnected = await databaseManager.connect();
+    if (!dbConnected) {
+      console.error('❌ Failed to connect to MongoDB. Server may not function properly.');
+    }
 
-    // Confirm successful connection
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
-
-    // Routes below
-
-    // GET all papers
-    app.get("/api/papers", async (req, res) => {
-      try {
-        const papers = await ResearchCollection.find({}).toArray();
-        res.send(papers);
-      } catch (err) {
-        res.status(500).send({ message: "Failed to fetch papers", error: err });
-      }
-    });
-
-    // Update paper status
-    app.put("/api/papers/:id/status", async (req, res) => {
-      const { id } = req.params;
-      const { status } = req.body;
-
-      try {
-        const result = await ResearchCollection.updateOne(
-          { _id: new ObjectId(id) },
-          { $set: { status } }
-        );
-
-        if (result.modifiedCount > 0) {
-          res.send({ message: "Status updated successfully" });
-        } else {
-          res.status(404).send({ message: "Paper not found or status unchanged" });
-        }
-      } catch (err) {
-        res.status(500).send({ message: "Failed to update status", error: err });
-      }
-    });
-
-    // Submit new paper with optional file upload
-    app.post("/api/submit", upload.single("file"), async (req, res) => {
-      const paper = req.body;
-
-      // If you want to handle the file upload and store a link, do it here
-      // e.g. upload file to cloudinary or store in DB
-      // paper.pdfUrl = req.file ? 'your_cloud_storage_url' : null;
-
-      try {
-        const result = await ResearchCollection.insertOne(paper);
-        res.status(201).send({ message: "Paper submitted successfully", id: result.insertedId });
-      } catch (err) {
-        res.status(500).send({ message: "Failed to submit paper", error: err });
-      }
-    });
-
-  } catch (err) {
-    console.error("MongoDB connection failed:", err);
+    // Test Cloudinary connection
+    await testConnection();
+    
+    console.log('🚀 Server initialization completed!');
+  } catch (error) {
+    console.error('❌ Server initialization failed:', error.message);
   }
 }
 
-run();
+// Initialize server on startup
+initializeServer();
 
-app.get("/", (req, res) => {
-  res.send("Research Portal is running");
+// Health check endpoint
+app.get("/health", async (req, res) => {
+  try {
+    const dbHealth = await databaseManager.healthCheck();
+    const cloudinaryHealth = await testConnection();
+    
+    res.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      database: dbHealth,
+      cloudinary: cloudinaryHealth ? 'connected' : 'disconnected',
+      uptime: process.uptime()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      message: error.message
+    });
+  }
 });
 
+// Routes
+const paperRoutes = require('./routes/paperRoutes');
+app.use('/api', paperRoutes);
+
+// Submit new paper with Cloudinary file upload
+app.post("/api/submit", upload.single("file"), handleUploadError, checkDatabaseConnection, async (req, res) => {
+  try {
+    const paper = req.body;
+    let fileData = null;
+
+    // Handle file upload to Cloudinary if file exists
+    if (req.file) {
+      const uploadResult = await uploadToCloudinary(req.file, 'research_papers');
+      
+      if (uploadResult.success) {
+        fileData = {
+          url: uploadResult.url,
+          public_id: uploadResult.public_id,
+          format: uploadResult.format,
+          size: uploadResult.size,
+          originalName: req.file.originalname
+        };
+        paper.fileData = fileData;
+      } else {
+        return res.status(500).json({
+          success: false,
+          message: "Failed to upload file to Cloudinary",
+          error: uploadResult.error
+        });
+      }
+    }
+
+    // Add timestamp
+    paper.submittedAt = new Date();
+    paper.status = paper.status || 'pending';
+
+    const collection = databaseManager.getCollection("researchpapers");
+    const result = await collection.insertOne(paper);
+    
+    res.status(201).json({
+      success: true,
+      message: "Paper submitted successfully",
+      id: result.insertedId,
+      fileData: fileData
+    });
+  } catch (err) {
+    console.error('Submit error:', err);
+    res.status(500).json({
+      success: false,
+      message: "Failed to submit paper",
+      error: err.message
+    });
+  }
+});
+
+// Root endpoint
+app.get("/", (req, res) => {
+  res.json({
+    message: "Research Portal is running",
+    database: databaseManager.isDatabaseConnected() ? 'connected' : 'disconnected',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down server gracefully...');
+  await databaseManager.disconnect();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('\n🛑 Shutting down server gracefully...');
+  await databaseManager.disconnect();
+  process.exit(0);
+});
+
+// Start server
 app.listen(port, () => {
-  console.log("Research Portal server is running on port", port);
+  console.log(`🚀 Research Portal server is running on port ${port}`);
+  console.log(`📊 Health check available at: http://localhost:${port}/health`);
 });
