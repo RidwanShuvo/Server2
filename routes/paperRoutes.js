@@ -63,19 +63,40 @@ router.get("/papers/:id", checkDatabaseConnection, async (req, res) => {
   }
 });
 
-// Update paper status
+// Update paper status with publication type
 router.put("/papers/:id/status", checkDatabaseConnection, async (req, res) => {
   const { id } = req.params;
-  const { status } = req.body;
+  const { status, publicationType } = req.body;
+
+  console.log('📝 Updating paper status:', { id, status, publicationType });
 
   try {
     const collection = databaseManager.getCollection("researchpapers");
+    
+    // Prepare update data
+    const updateData = { submissionStatus: status };
+
+    // If approving, also set the status field for proper categorization
+    if (status === 'approved') {
+      if (publicationType === 'published') {
+        updateData.status = 'published';
+      } else {
+        updateData.status = 'unpublished';
+      }
+    } else {
+      // For rejected/pending, set status to unpublished
+      updateData.status = 'unpublished';
+    }
+
+    console.log('📝 Update data:', updateData);
+
     const result = await collection.updateOne(
       { _id: new ObjectId(id) },
-      { $set: { status, updatedAt: new Date() } }
+      { $set: { ...updateData, updatedAt: new Date() } }
     );
 
     if (result.modifiedCount > 0) {
+      console.log('✅ Paper updated successfully');
       res.json({
         success: true,
         message: "Status updated successfully"
